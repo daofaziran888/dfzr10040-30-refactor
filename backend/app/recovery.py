@@ -2,6 +2,7 @@
 
 与重放队列联动，融合作业失败后在队列中记录，
 按退避策略重试，支持断点恢复。
+批次步进、游标更新与批次确认依据核对由 app.batch_cursor 共用逻辑承载。
 """
 from __future__ import annotations
 
@@ -10,6 +11,16 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+
+from app.batch_cursor import (
+    BatchConfirmation,
+    ConfirmationLedger,
+    confirmation_from_payload,
+    confirmation_ledger,
+    digest_content,
+    effective_start,
+    plan_segments,
+)
 
 
 def _now_iso() -> str:
@@ -139,9 +150,15 @@ class ReplayQueue:
 class CheckpointManager:
     """检查点管理器：维护回填任务的断点位置与恢复元数据。"""
 
-    def __init__(self) -> None:
+    def __init__(self, ledger: ConfirmationLedger | None = None) -> None:
         self._checkpoints: dict[str, dict[str, Any]] = {}
         self._recovery_log: list[dict[str, Any]] = []
+        self._ledger = ledger if ledger is not None else confirmation_ledger
+
+    @property
+    def ledger(self) -> ConfirmationLedger:
+        """批次确认依据台账：与回填入口共用，用于核对批次确认依据。"""
+        return self._ledger
 
     def save_checkpoint(self, task_code: str, position: str,
                         metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -194,36 +211,42 @@ class CheckpointManager:
                                replay_fn: Any,
                                total_items: int,
                                batch_size: int = 100) -> dict[str, Any]:
-        """从检查点重放处理：调用 replay_fn(batch_items, start_index) 逐批恢复。"""
+        """从检查点重放处理：调用 replay_fn(batch_items, start_index) 逐批恢复。
+
+        续办起点取断点游标与回填接收方确认边界的较大者，按实际确认的
+        行边界选择下一次回调的起点；回调返回的确认依据按来源、行边界和
+        内容摘要核对，不符时不推进游标、不跳过任何一行。
+        """
         checkpoint = self.load_checkpoint(task_code)
-        start_idx = 0
-        if checkpoint:
-            try:
-                start_idx = int(checkpoint.get("position", 0))
-            except (ValueError, TypeError):
-                start_idx = 0
+        saved_position = checkpoint.get("position", 0) if checkpoint else 0
+        confirmed = self._ledger.confirmed_boundary(task_code)
+        start_idx = effective_start(saved_position, confirmed)
 
         self.record_recovery(task_code, "replay_started",
-                             {"start_idx": start_idx, "total": total_items})
+                             {"start_idx": start_idx, "total": total_items,
+                              "confirmed_boundary": confirmed})
 
         processed = start_idx
-        current = start_idx
         errors: list[dict[str, Any]] = []
 
-        while current < total_items:
-            end_idx = min(current + batch_size, total_items)
-            batch = list(range(current, end_idx))
+        for seg_start, seg_end in plan_segments(start_idx, total_items, batch_size):
+            batch = list(range(seg_start, seg_end))
             try:
-                result = replay_fn(batch, current)
+                result = replay_fn(batch, seg_start)
                 if isinstance(result, dict) and not result.get("ok", True):
-                    errors.append({"segment": f"{current}-{end_idx}",
+                    errors.append({"segment": f"{seg_start}-{seg_end}",
                                    "error": result.get("message", "unknown")})
                     break
-                processed = end_idx
+                ok, message = self._confirm_batch(
+                    task_code, result, seg_start, seg_end, digest_content(batch))
+                if not ok:
+                    errors.append({"segment": f"{seg_start}-{seg_end}",
+                                   "error": message})
+                    break
+                processed = seg_end
                 self.save_checkpoint(task_code, str(processed))
-                current = end_idx
             except Exception as e:
-                errors.append({"segment": f"{current}-{end_idx}", "error": str(e)})
+                errors.append({"segment": f"{seg_start}-{seg_end}", "error": str(e)})
                 break
 
         complete = processed >= total_items
@@ -242,6 +265,24 @@ class CheckpointManager:
             "complete": complete,
             "errors": errors,
         }
+
+    def _confirm_batch(self, task_code: str, result: Any,
+                       seg_start: int, seg_end: int,
+                       expected_digest: str) -> tuple[bool, str]:
+        """核对本批确认依据：回调未给出确认时按既有契约自动登记。"""
+        payload = result.get("confirmation") if isinstance(result, dict) else None
+        if payload is None:
+            source = self._ledger.bind_source(task_code, "replay_callback")
+            confirmation = BatchConfirmation(
+                source=source, start=seg_start, end=seg_end, digest=expected_digest)
+        else:
+            confirmation = confirmation_from_payload(payload)
+            if confirmation is None:
+                return False, "确认依据格式非法"
+        return self._ledger.record(
+            task_code, confirmation,
+            expected_start=seg_start, expected_end=seg_end,
+            expected_digest=expected_digest)
 
 
 # 全局单例

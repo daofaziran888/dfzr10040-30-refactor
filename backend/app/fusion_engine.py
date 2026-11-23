@@ -10,6 +10,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from app.batch_cursor import (
+    BatchConfirmation,
+    ConfirmationLedger,
+    confirmation_ledger,
+    digest_content,
+    effective_start,
+    plan_segments,
+)
 from app.models import (
     BackfillTask,
     ColdStoreStrategy,
@@ -42,7 +50,7 @@ def _generate_code(prefix: str, index: int) -> str:
 class FusionEngine:
     """熔炉引擎：编排跨模块数据融合流水线。"""
 
-    def __init__(self) -> None:
+    def __init__(self, ledger: ConfirmationLedger | None = None) -> None:
         self._sources: dict[int, SourceDef] = {}
         self._schemas: dict[int, SchemaMapping] = {}
         self._wide_tables: dict[int, WideTableDef] = {}
@@ -61,6 +69,12 @@ class FusionEngine:
         self._drifts: dict[int, DataDriftRecord] = {}
         self._monitors: dict[int, FusionMonitorMetric] = {}
         self._next_id: int = 1
+        self._ledger = ledger if ledger is not None else confirmation_ledger
+
+    @property
+    def confirmation_ledger(self) -> ConfirmationLedger:
+        """批次确认依据台账：与重放入口共用，用于核对批次确认依据。"""
+        return self._ledger
 
     def _next_seq(self) -> int:
         sid = self._next_id
@@ -476,27 +490,41 @@ class FusionEngine:
         """执行带断点续传的数据回填。
 
         从 checkpoint_position 处继续处理，失败时保留断点可恢复。
+        续办起点取断点游标与接收方确认边界的较大者：已确认的数据不重复
+        纳入，重放已提交的范围也能接续；每批写入同步登记批次确认依据。
         """
         task = self._backfills.get(backfill_id)
         if task is None:
             return {"ok": False, "message": f"回填任务 {backfill_id} 不存在"}
 
-        start_idx = 0
-        if task.checkpoint_position:
-            try:
-                start_idx = int(task.checkpoint_position)
-            except (ValueError, TypeError):
-                start_idx = 0
+        total = len(source_records)
+        receiver = self._ledger.bind_source(task.task_code, task.target_wide_table)
+        start_idx = effective_start(
+            task.checkpoint_position,
+            self._ledger.confirmed_boundary(task.task_code),
+        )
 
         batch_size = max(task.parallel_partitions * 100, 100)
-        end_idx = min(start_idx + batch_size, len(source_records))
+        step = next(plan_segments(start_idx, total, batch_size), None)
+        end_idx = step[1] if step is not None else start_idx
         batch = source_records[start_idx:end_idx]
+
+        if end_idx > start_idx:
+            # 登记接收方批次确认依据：来源、行边界与内容摘要与本批一致
+            self._ledger.record(
+                task.task_code,
+                BatchConfirmation(
+                    source=receiver, start=start_idx, end=end_idx,
+                    digest=digest_content(batch)),
+                expected_start=start_idx, expected_end=end_idx,
+                expected_digest=digest_content(batch),
+            )
 
         processed = len(batch)
         task.processed_rows += processed
-        task.remaining_rows = max(0, len(source_records) - end_idx)
+        task.remaining_rows = max(0, total - end_idx)
 
-        if end_idx < len(source_records):
+        if end_idx < total:
             task.checkpoint_position = str(end_idx)
             complete = False
         else:
